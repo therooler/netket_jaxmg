@@ -1,2 +1,3 @@
-jaxmg==0.2.0
+jaxmg[cuda12]==0.0.3
+jax[cuda12]==0.7.2
 netket==3.20.5
