@@ -4,6 +4,18 @@ Variational Monte Carlo simulations for quantum many-body systems using neural q
 
 Makes use of [jaxmg](https://flatironinstitute.github.io/jaxmg/) to invert the NTK over multiple GPUs, allowing for an NTK of size $262144\times 262144$ to be inverted on 8 H200s.
 
+If you end up using this code, please cite the corresponding references in Netket: https://netket.readthedocs.io/en/latest/cite.html
+and the white paper from JAXMg:
+
+```
+@misc{2601.14466,
+    Author = {Roeland Wiersema},
+    Title = {JAXMg: A multi-GPU linear solver in JAX},
+    Year = {2026},
+    Eprint = {arXiv:2601.14466},
+}
+```
+
 ## Installation
 
 ```bash
