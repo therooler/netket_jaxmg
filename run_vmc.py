@@ -5,6 +5,7 @@ import time
 from tqdm import tqdm
 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+os.environ["XLA_FLAGS"] = "--xla_gpu_enable_analytical_sol_latency_estimator=false"
 # os.environ["NETKET_EXPERIMENTAL_FFT_AUTOCORRELATION"] = "false"
 
 if platform.system() == "Linux":
@@ -16,8 +17,6 @@ if platform.system() == "Linux":
         print(f"world_size: {world_size}")
         print(f"rank: {rank}")
         cuda_visible_devices = os.environ["CUDA_VISIBLE_DEVICES"]
-        local_device_ids = [int(c) for c in cuda_visible_devices.split(",")]
-        print("local_device_ids:", local_device_ids)
         time.sleep(1)
         import jax
 
@@ -25,7 +24,7 @@ if platform.system() == "Linux":
             coordinator_address=coordinator_address,
             num_processes=world_size,
             process_id=rank,
-            local_device_ids=local_device_ids,
+            local_device_ids=rank,
         )
         print("Done initializing jax")
     except KeyError:
@@ -39,19 +38,23 @@ else:
     os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={ndev}"
     import jax
 
+jax.config.update("jax_enable_x64", True)
 import netket as nk
 
 from functools import partial
 
 import optax
-from src.vmc_sr import VMC_SR
 
+from src.vmc_sr import VMC_SR
 from src.logger import Logger
 from src.experiment_config import (
     ExperimentConfig,
     HypercubeConfig,
     HilbertConfig,
     TFIMConfig,
+    J1J2Config,
+    HeisenbergConfig,
+    TriangularConfig,
     SamplerConfig,
     ResCNNConfig,
     ViT2DConfig,
@@ -66,6 +69,18 @@ from src.experiment_config import (
 )
 import jax.numpy as jnp
 
+import platform
+from functools import partial
+from jax.sharding import PartitionSpec as P, NamedSharding
+
+system = platform.system()
+
+if system == "Linux":
+    from jaxmg import potrs
+    JAXMG_ENABLED=True
+else:
+    JAXMG_ENABLED=False
+
 
 def check_info(step, log, driver, save_path):
     if not isinstance(driver.info, dict):
@@ -77,47 +92,63 @@ def check_info(step, log, driver, save_path):
         else:
             # np.save(save_path + f"error_local_energies_{step%10}.npy", driver.state.local_estimators(driver._ham))
             return True
+    return ~jnp.isnan(driver._loss_stats.mean)
 
-    return True
+
+fields_to_track = (("Energy", "Mean"), ("Energy", "Variance"))
 
 
-def main(args):
-    lattice_cfg = HypercubeConfig(L=args.L)
-    hilbert_cfg = HilbertConfig()
-    critical_h = 3.044382
-    tfim_cfg = TFIMConfig(J=1.0, h=critical_h)
+def main(args, return_logger=False):
+    lattice_cfg = TriangularConfig(L=args.L, max_neighbor_order=1)
+    hilbert_cfg = HilbertConfig(total_sz=0)
+    # critical_h = 3.044382
+    # tfim_cfg = TFIMConfig(J=1.0, h=critical_h)
+    # J2=0.0
+    # system_cfg = J1J2Config(J=(1.0, J2))
+    system_cfg = HeisenbergConfig(sign_rule=None)
     sampler_cfg = SamplerConfig()
-    rbmsymm_cfg = ViT2DConfig(
-        L_eff=args.L_eff,
+    model_cfg = ViT2DConfig(
+        patch_size=args.patch_size,
         num_layers=args.num_layers,
         d_model=args.d_model,
         heads=args.heads,
-        b=args.b
     )
-    diag_shift_cfg = ConstantSchedule(1e-4)
+    diag_shift_cfg = ConstantSchedule(1e-3)
     # ConstantSchedule(value=0.01)
-    lr_cfg = ConstantSchedule(5e-3)
+    lr_cfg = CosineDecaySchedule(0.03 / 4, 10000, (0.03 / 4) / 10)
     optimizer_cfg = OptimizerConfig(lr=lr_cfg, diag_shift=diag_shift_cfg)
+    # sr_cfg = SRConfig(chunk_size=None)
     sr_cfg = SRConfig(chunk_size=args.chunk_size)
 
     config = ExperimentConfig(
         seed=args.seed,
         n_samples=args.ns,
-        n_steps=1000,
-        thermalize_steps=1,
+        n_steps=10000,
+        thermalize_steps=0,
         root="./data",
-        name="Oct21",
+        name=args.experiment_name,
         lattice=lattice_cfg,
         hilbert=hilbert_cfg,
-        hamiltonian=tfim_cfg,
+        hamiltonian=system_cfg,
         sampler=sampler_cfg,
-        model=rbmsymm_cfg,
+        model=model_cfg,
         optimizer=optimizer_cfg,
         sr=sr_cfg,
     )
+    save_path = config.save_path()
+    if jax.process_index() == 0:
+        print(f"Making path in process {jax.process_index()}")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        config.save_config_yaml()
+    logger = Logger(
+        path=save_path, fields=fields_to_track, save_every=10, rank=jax.process_index()
+    )
+    if return_logger:
+        return logger
+
     print(config)
     print(f"Save path {config.save_path()}")
-    config.save_config_yaml()
 
     hamiltonian = config.build_hamiltonian()
     sampler = config.build_sampler()
@@ -129,26 +160,20 @@ def main(args):
         sampler=sampler,
         model=model,
         sampler_seed=subkey,
-        n_samples_per_rank=sampler.n_chains_per_rank
+        n_samples_per_rank=sampler.n_chains_per_rank,
+        chunk_size=config.sr.chunk_size,
+        n_discard_per_chain=0,
     )
     npar = vstate.n_parameters
     print(f"Number of parameters {npar}")
     print(f"Memory allocated: {args.ns**2 * jnp.dtype(jnp.float64).itemsize/1e9} GB")
-    save_path = config.save_path()
-    fields = (("Energy", "Mean"), ("Energy", "Variance"))
-    if jax.process_index() == 0:
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-    logger = Logger(
-        path=save_path, fields=fields, save_every=10, rank=jax.process_index()
-    )
+
     restored = logger.restore(vstate)
     if restored:
         step = logger.data["iters"]["values"][-1]
         # logger.restore_samples(vstate)
         print("Restored step:", step)
         print("Last energy:", logger.data["Energy"]["Mean"][-1])
-
     else:
         step = 0
     if step < config.n_steps - 1:
@@ -159,13 +184,44 @@ def main(args):
         print("SR optimization")
 
         optimizer = optax.sgd(learning_rate=config.optimizer.build_lr())
+
+        print(sampler.n_chains_per_rank)
+        if JAXMG_ENABLED:
+            print("Using JAXMg...")
+            linear_solver = partial(
+                    potrs,
+                    T_A=2**12,
+                    mesh=jax.sharding.get_abstract_mesh(),
+                    in_specs = (P("S", None), P(None, None))
+                )
+        else:
+            linear_solver = nk.optimizer.solver.cholesky
         driver = VMC_SR(
             hamiltonian,
             variational_state=vstate,
             optimizer=optimizer,
             diag_shift=config.optimizer.build_diag_shift(),
             chunk_size_bwd=config.sr.chunk_size,
+            momentum=False,
+            linear_solver=linear_solver
         )
+        # else:
+        #     driver = VMC_SR(
+        #         hamiltonian,
+        #         variational_state=vstate,
+        #         optimizer=optimizer,
+        #         diag_shift=config.optimizer.build_diag_shift(),
+        #         chunk_size_bwd=config.sr.chunk_size,
+        #         momentum=False
+        #     )
+            # driver = nk.driver.VMC_SR(
+            #     hamiltonian,
+            #     variational_state=vstate,
+            #     optimizer=optimizer,
+            #     diag_shift=config.optimizer.build_diag_shift(),
+            #     chunk_size_bwd=config.sr.chunk_size,
+            #     momentum=False
+            # )
         driver._step_count = step
         driver.run(
             config.n_steps - step,
@@ -181,15 +237,21 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Parser for training RNN WF")
     # Optional argument
-    parser.add_argument("--ns", type=int, default=2**16, help="Number of samples")
-    parser.add_argument("--L_eff", type=int, default=25, help="Effective patch size")
-    parser.add_argument("--num_layers", type=int, default=8, help="Number of layers")
-    parser.add_argument("--d_model", type=int, default=36, help="Model hidden vector size" )
-    parser.add_argument("--heads", type=int, default=4, help="Number of MHA heads")
-    parser.add_argument("--b", type=int, default=2, help="b patch")
-    parser.add_argument("--L", type=int, default=10, help="Lattice size of 2D lattice")
-    parser.add_argument( "--chunk_size", type=int, default=2**12, help="Jacobian chunk size NTK")
+    parser.add_argument("--ns", type=int, default=2**12, help="Number of samples")
+    parser.add_argument(
+        "--patch_size", type=int, default=3, help="Effective patch size"
+    )
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of layers")
+    parser.add_argument(
+        "--d_model", type=int, default=72, help="Model hidden vector size"
+    )
+    parser.add_argument("--heads", type=int, default=12, help="Number of MHA heads")
+    parser.add_argument("--L", type=int, default=4, help="Lattice size of 2D lattice")
+    parser.add_argument(
+        "--chunk_size", type=int, default=2**11, help="Jacobian chunk size NTK"
+    )
     parser.add_argument("--seed", type=int, default=100, help="Seed")
+    parser.add_argument("--experiment_name", type=str, default="Feb12", help="Experiment name")
     args = parser.parse_args()
 
     main(args)

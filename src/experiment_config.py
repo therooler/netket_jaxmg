@@ -11,7 +11,7 @@ import netket as nk
 from jax.nn.initializers import normal
 import optax
 from .res_cnn import ResCNN
-from .transformer import ViT
+from .transformer import ViT2D
 
 
 # =========================
@@ -111,6 +111,29 @@ class HypercubeConfig(LatticeConfig):
 
 
 @dataclass
+class TriangularConfig(LatticeConfig):
+    type: Literal["Triangular"] = "Triangular"
+    L: int = 10
+    pbc: bool = True
+    max_neighbor_order: int = 2
+
+    def __post_init__(self):
+        self.name = f"Triangular_L{self.L}_{'pbc' if self.pbc else ''}"
+
+    def build(self):
+        if self._built_object is not None:
+            return self._built_object
+        assert self.type == "Triangular", "Only Triangular is supported here"
+        lattice = nk.graph.Triangular(
+            extent=[self.L, self.L],
+            pbc=self.pbc,
+            max_neighbor_order=self.max_neighbor_order,
+        )
+        self._built_object = lattice
+        return lattice
+
+
+@dataclass
 class HilbertConfig:
     s: float = 0.5
     total_sz: int = None
@@ -134,10 +157,28 @@ class HamiltonianConfig:
 
 
 @dataclass
+class HeisenbergConfig(HamiltonianConfig):
+    sign_rule: Tuple[bool, bool] = (False, False)
+
+    def __post_init__(self):
+        self.name = "Heisenberg"
+
+    def build(self, hilbert, lattice):
+        if self._built_object is not None:
+            return self._built_object
+        hamiltonian = nk.operator.Heisenberg(
+            hilbert=hilbert,
+            graph=lattice,
+            sign_rule=self.sign_rule,
+        ).to_jax_operator()
+        self._built_object = hamiltonian
+        return hamiltonian
+
+
+@dataclass
 class J1J2Config(HamiltonianConfig):
     J: Tuple[float, float] = (1.0, 0.5)
     sign_rule: Tuple[bool, bool] = (False, False)
-    marshall_sign: bool = False  # tracked for completeness
 
     def __post_init__(self):
         self.name = "J1J2"
@@ -149,7 +190,7 @@ class J1J2Config(HamiltonianConfig):
             hilbert=hilbert,
             graph=lattice,
             J=list(self.J),
-            sign_rule=list(self.sign_rule),
+            sign_rule=self.sign_rule,
         ).to_jax_operator()
         self._built_object = hamiltonian
         return hamiltonian
@@ -310,26 +351,23 @@ class ResCNNConfig(ModelConfig):
 
 @dataclass
 class ViT2DConfig(ModelConfig):
-    L_eff: int = 25
+    patch_size: int = 25
     num_layers: int = 8
     d_model: int = 72
     heads: int = 12
-    b: int = 2
 
     def __post_init__(self):
-        self.name = f"ViTConfig{self.L_eff}_Leff_{self.num_layers}_nl_{self.d_model}_dm_{self.heads}_heads_{self.b}_b"
+        self.name = f"ViTConfig_patch_size{self.patch_size}_nl{self.num_layers}_dm{self.d_model}_heads{self.heads}"
 
     def build(self, lattice):
         if self._built_object is not None:
             return self._built_object
-        model = ViT(
-            L_eff=self.L_eff,
+        model = ViT2D(
             num_layers=self.num_layers,
             d_model=self.d_model,
-            heads=self.heads,
-            b=self.b,
+            n_heads=self.heads,
+            patch_size=self.patch_size,
             transl_invariant=True,
-            two_dimensional=True,
         )
         self._built_object = model
         return model
@@ -399,7 +437,11 @@ class ExperimentConfig:
     def to_dict(self) -> Dict[str, Any]:
         def _convert(obj):
             if hasattr(obj, "__dataclass_fields__"):
-                d = {k: _convert(v) for k, v in asdict(obj).items()}
+                d = {
+                    k: _convert(v)
+                    for k, v in asdict(obj).items()
+                    if not k.startswith("_")
+                }
                 if hasattr(obj, "type"):
                     d["type"] = getattr(obj, "type")
                 return d

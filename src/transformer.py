@@ -3,91 +3,116 @@ import jax.numpy as jnp
 
 from flax import linen as nn
 import jax.numpy as jnp
-
+from typing import Any
 from einops import rearrange
 
-from .attentions import FMHA
+from functools import partial
+import netket as nk
 
 
-def log_cosh(x):
-    sgn_x = -2 * jnp.signbit(x.real) + 1
-    x = x * sgn_x
-    return x + jnp.log1p(jnp.exp(-2.0 * x)) - jnp.log(2.0)
-
-
-def extract_patches1d(x, b):
-    return rearrange(x, "batch (L_eff b) -> batch L_eff b", b=b)
-
-
-def extract_patches2d(x, b):
+def extract_patches2d(x, patch_size):
     batch = x.shape[0]
-    L_eff = int((x.shape[1] // b**2) ** 0.5)
-    x = x.reshape(batch, L_eff, b, L_eff, b)  # [L_eff, b, L_eff, b]
-    x = x.transpose(0, 1, 3, 2, 4)  # [L_eff, L_eff, b, b]
-    # flatten the patches
-    x = x.reshape(batch, L_eff, L_eff, -1)  # [L_eff, L_eff, b*b]
-    x = x.reshape(batch, L_eff * L_eff, -1)  # [L_eff*L_eff, b*b]
+    n_patches = int((x.shape[1] // patch_size**2) ** 0.5)
+    x = x.reshape(batch, n_patches, patch_size, n_patches, patch_size)
+    x = x.transpose(0, 1, 3, 2, 4)
+    x = x.reshape(batch, n_patches, n_patches, -1)
+    x = x.reshape(batch, n_patches * n_patches, -1)
     return x
 
 
+class ViT2D(nn.Module):
+    num_layers: int  # number of layers
+    d_model: int  # dimensionality of the embedding space
+    n_heads: int  # number of heads
+    patch_size: int  # linear patch size
+    transl_invariant: bool = False
+
+    @nn.compact
+    def __call__(self, spins):
+        x = jnp.atleast_2d(spins)
+
+        Ns = x.shape[-1]  # number of sites
+        n_patches = Ns // self.patch_size**2  # lenght of the input sequence
+
+        x = Embed(d_model=self.d_model, patch_size=self.patch_size)(x)
+
+        y = Encoder(
+            num_layers=self.num_layers,
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            n_patches=n_patches,
+            transl_invariant=self.transl_invariant,
+        )(x)
+
+        log_psi = OuputHead(d_model=self.d_model)(y)
+
+        return log_psi
+
+
 class Embed(nn.Module):
-    d_model: int
-    b: int
-    two_dimensional: bool = False
+    d_model: int  # dimensionality of the embedding space
+    patch_size: int  # linear patch size
+    param_dtype = jnp.float64
 
     def setup(self):
-        if self.two_dimensional:
-            self.extract_patches = extract_patches2d
-        else:
-            self.extract_patches = extract_patches1d
-
         self.embed = nn.Dense(
             self.d_model,
             kernel_init=nn.initializers.xavier_uniform(),
-            param_dtype=jnp.float64,
-            dtype=jnp.float64,
+            param_dtype=self.param_dtype,
         )
 
     def __call__(self, x):
-        x = self.extract_patches(x, self.b)
+        x = extract_patches2d(x, self.patch_size)
         x = self.embed(x)
 
         return x
 
 
+def roll(J, shift, axis=-1):
+    return jnp.roll(J, shift, axis=axis)
+
+
+@partial(jax.vmap, in_axes=(None, 0, None), out_axes=1)
+@partial(jax.vmap, in_axes=(None, None, 0), out_axes=1)
+def roll2d(spins, i, j):
+    side = int(spins.shape[-1] ** 0.5)
+    spins = spins.reshape(spins.shape[0], side, side)
+    spins = jnp.roll(jnp.roll(spins, i, axis=-2), j, axis=-1)
+    return spins.reshape(spins.shape[0], -1)
+
+
 class EncoderBlock(nn.Module):
-    d_model: int
-    h: int
-    L_eff: int
-    transl_invariant: bool = True
-    two_dimensional: bool = False
+    d_model: int  # dimensionality of the embedding space
+    n_heads: int  # number of heads
+    n_patches: int  # lenght of the input sequence
+    transl_invariant: bool = False
+    param_dtype = jnp.float64
 
     def setup(self):
-        self.attn = FMHA(
+        self.attn = Spatial_Attention(
             d_model=self.d_model,
-            h=self.h,
-            L_eff=self.L_eff,
+            h=self.n_heads,
+            L_eff=self.n_patches,
             transl_invariant=self.transl_invariant,
-            two_dimensional=self.two_dimensional,
+            two_dimensional=True,
+            dtype=self.param_dtype
         )
 
-        self.layer_norm_1 = nn.LayerNorm(dtype=jnp.float64, param_dtype=jnp.float64)
-        self.layer_norm_2 = nn.LayerNorm(dtype=jnp.float64, param_dtype=jnp.float64)
+        self.layer_norm_1 = nn.LayerNorm(param_dtype=self.param_dtype)
+        self.layer_norm_2 = nn.LayerNorm(param_dtype=self.param_dtype)
 
         self.ff = nn.Sequential(
             [
                 nn.Dense(
                     4 * self.d_model,
                     kernel_init=nn.initializers.xavier_uniform(),
-                    param_dtype=jnp.float64,
-                    dtype=jnp.float64,
+                    param_dtype=self.param_dtype,
                 ),
                 nn.gelu,
                 nn.Dense(
                     self.d_model,
                     kernel_init=nn.initializers.xavier_uniform(),
-                    param_dtype=jnp.float64,
-                    dtype=jnp.float64,
+                    param_dtype=self.param_dtype,
                 ),
             ]
         )
@@ -100,21 +125,19 @@ class EncoderBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    num_layers: int
-    d_model: int
-    h: int
-    L_eff: int
-    transl_invariant: bool = True
-    two_dimensional: bool = False
+    num_layers: int  # number of layers
+    d_model: int  # dimensionality of the embedding space
+    n_heads: int  # number of heads
+    n_patches: int  # lenght of the input sequence
+    transl_invariant: bool = False
 
     def setup(self):
         self.layers = [
             EncoderBlock(
                 d_model=self.d_model,
-                h=self.h,
-                L_eff=self.L_eff,
+                n_heads=self.n_heads,
+                n_patches=self.n_patches,
                 transl_invariant=self.transl_invariant,
-                two_dimensional=self.two_dimensional,
             )
             for _ in range(self.num_layers)
         ]
@@ -127,80 +150,89 @@ class Encoder(nn.Module):
         return x
 
 
+log_cosh = (
+    nk.nn.activation.log_cosh
+)  # Logarithm of the hyperbolic cosine, implemented in a more stable way
+
+
 class OuputHead(nn.Module):
-    d_model: int
+    d_model: int  # dimensionality of the embedding space
+    param_dtype = jnp.float64
 
     def setup(self):
-        self.out_layer_norm = nn.LayerNorm(dtype=jnp.float64, param_dtype=jnp.float64)
+        self.out_layer_norm = nn.LayerNorm(param_dtype=self.param_dtype)
 
         self.norm2 = nn.LayerNorm(
-            use_scale=True, use_bias=True, dtype=jnp.float64, param_dtype=jnp.float64
+            use_scale=True, use_bias=True, param_dtype=self.param_dtype
         )
         self.norm3 = nn.LayerNorm(
-            use_scale=True, use_bias=True, dtype=jnp.float64, param_dtype=jnp.float64
+            use_scale=True, use_bias=True, param_dtype=self.param_dtype
         )
 
         self.output_layer0 = nn.Dense(
             self.d_model,
-            param_dtype=jnp.float64,
-            dtype=jnp.float64,
+            param_dtype=self.param_dtype,
             kernel_init=nn.initializers.xavier_uniform(),
             bias_init=jax.nn.initializers.zeros,
         )
         self.output_layer1 = nn.Dense(
             self.d_model,
-            param_dtype=jnp.float64,
-            dtype=jnp.float64,
+            param_dtype=self.param_dtype,
             kernel_init=nn.initializers.xavier_uniform(),
             bias_init=jax.nn.initializers.zeros,
         )
 
-    def __call__(self, x, return_z=False):
+    def __call__(self, x):
 
         z = self.out_layer_norm(x.sum(axis=1))
-        if return_z:
-            return z
 
-        amp = self.norm2(self.output_layer0(z))
-        sign = self.norm3(self.output_layer1(z))
+        out_real = self.norm2(self.output_layer0(z))
+        out_imag = self.norm3(self.output_layer1(z))
 
-        out = amp + 1j * sign
+        out = out_real + 1j * out_imag
 
         return jnp.sum(log_cosh(out), axis=-1)
 
 
-class ViT(nn.Module):
-    num_layers: int
-    d_model: int
-    heads: int
+def pbc_distance_grid(L: int, i0: int = 0, j0: int = 0) -> jnp.ndarray:
+    I, J = jnp.indices((L, L))
+    dx = jnp.abs(I - i0)
+    dy = jnp.abs(J - j0)
+    dx = jnp.minimum(dx, L - dx)
+    dy = jnp.minimum(dy, L - dy)
+    return jnp.hypot(dx, dy)
+
+class Spatial_Attention(nn.Module):
+    d_model : int
+    h: int
     L_eff: int
-    b: int
+    dtype: Any
     transl_invariant: bool = True
     two_dimensional: bool = False
+    alpha0: float = 1.0
 
     def setup(self):
-        self.patches_and_embed = Embed(
-            self.d_model, self.b, two_dimensional=self.two_dimensional
-        )
+        self.v = nn.Dense(self.d_model, kernel_init=nn.initializers.xavier_uniform(), param_dtype=self.dtype)
+        assert self.two_dimensional and self.transl_invariant
 
-        self.encoder = Encoder(
-            num_layers=self.num_layers,
-            d_model=self.d_model,
-            h=self.heads,
-            L_eff=self.L_eff,
-            transl_invariant=self.transl_invariant,
-            two_dimensional=self.two_dimensional,
-        )
+        sq_L_eff = int(self.L_eff**0.5)
+        distances = pbc_distance_grid(sq_L_eff, 0, 0).flatten()
+        self.J = self.param("J", nn.initializers.xavier_uniform(), (self.h, self.L_eff), self.dtype)
+        self.alpha = self.param("alpha", nn.initializers.constant(self.alpha0), (self.h, 1), self.dtype)
+        self.J *= jax.nn.softmax(-self.alpha*distances)
+        self.J = roll2d(self.J, jnp.arange(sq_L_eff), jnp.arange(sq_L_eff))
+        self.J = self.J.reshape(self.h, -1, self.L_eff)
 
-        self.output = OuputHead(self.d_model)
+        self.W = nn.Dense(self.d_model, kernel_init=nn.initializers.xavier_uniform(), param_dtype=self.dtype)
 
-    def __call__(self, spins, return_z=False):
-        x = jnp.atleast_2d(spins)
+    def __call__(self, x):
+        v = self.v(x)
+        v = rearrange(v, 'batch L_eff (h d_eff) -> batch L_eff h d_eff', h=self.h)
+        v = rearrange(v, 'batch L_eff h d_eff -> batch h L_eff d_eff')
+        x = jnp.matmul(self.J, v)
+        x = rearrange(x, 'batch h L_eff d_eff  -> batch L_eff h d_eff')
+        x = rearrange(x, 'batch L_eff h d_eff ->  batch L_eff (h d_eff)')
 
-        x = self.patches_and_embed(x)
+        x = self.W(x)
 
-        x = self.encoder(x)
-
-        output = self.output(x, return_z=return_z)
-
-        return output
+        return x
