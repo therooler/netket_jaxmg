@@ -77,9 +77,10 @@ system = platform.system()
 
 if system == "Linux":
     from jaxmg import potrs
-    JAXMG_ENABLED=True
+
+    JAXMG_ENABLED = True
 else:
-    JAXMG_ENABLED=False
+    JAXMG_ENABLED = False
 
 
 def check_info(step, log, driver, save_path):
@@ -113,9 +114,10 @@ def main(args, return_logger=False):
         d_model=args.d_model,
         heads=args.heads,
     )
-    diag_shift_cfg = ConstantSchedule(1e-3)
+    diag_shift_cfg = ConstantSchedule(args.diag_shift)
     # ConstantSchedule(value=0.01)
-    lr_cfg = CosineDecaySchedule(0.03 / 4, 10000, (0.03 / 4) / 10)
+    lr_init = args.lr
+    lr_cfg = CosineDecaySchedule(lr_init, 10000, lr_init / 10)
     optimizer_cfg = OptimizerConfig(lr=lr_cfg, diag_shift=diag_shift_cfg)
     # sr_cfg = SRConfig(chunk_size=None)
     sr_cfg = SRConfig(chunk_size=args.chunk_size)
@@ -124,7 +126,7 @@ def main(args, return_logger=False):
         seed=args.seed,
         n_samples=args.ns,
         n_steps=10000,
-        thermalize_steps=0,
+        thermalize_steps=args.thermalizing_steps,
         root="./data",
         name=args.experiment_name,
         lattice=lattice_cfg,
@@ -163,6 +165,7 @@ def main(args, return_logger=False):
         n_samples_per_rank=sampler.n_chains_per_rank,
         chunk_size=config.sr.chunk_size,
         n_discard_per_chain=0,
+        seed=subkey
     )
     npar = vstate.n_parameters
     print(f"Number of parameters {npar}")
@@ -179,7 +182,7 @@ def main(args, return_logger=False):
     if step < config.n_steps - 1:
         print("Thermalizing...")
         for _ in tqdm(range(config.thermalize_steps)):
-            vstate.sample()
+            x = vstate.sample()
         print("Thermalizing done")
         print("SR optimization")
 
@@ -189,11 +192,11 @@ def main(args, return_logger=False):
         if JAXMG_ENABLED:
             print("Using JAXMg...")
             linear_solver = partial(
-                    potrs,
-                    T_A=2**12,
-                    mesh=jax.sharding.get_abstract_mesh(),
-                    in_specs = (P("S", None), P(None, None))
-                )
+                potrs,
+                T_A=2**12,
+                mesh=jax.sharding.get_abstract_mesh(),
+                in_specs=(P("S", None), P(None, None)),
+            )
         else:
             linear_solver = nk.optimizer.solver.cholesky
         driver = VMC_SR(
@@ -203,7 +206,8 @@ def main(args, return_logger=False):
             diag_shift=config.optimizer.build_diag_shift(),
             chunk_size_bwd=config.sr.chunk_size,
             momentum=False,
-            linear_solver=linear_solver
+            linear_solver=linear_solver,
+            q=args.q,
         )
         # else:
         #     driver = VMC_SR(
@@ -214,14 +218,14 @@ def main(args, return_logger=False):
         #         chunk_size_bwd=config.sr.chunk_size,
         #         momentum=False
         #     )
-            # driver = nk.driver.VMC_SR(
-            #     hamiltonian,
-            #     variational_state=vstate,
-            #     optimizer=optimizer,
-            #     diag_shift=config.optimizer.build_diag_shift(),
-            #     chunk_size_bwd=config.sr.chunk_size,
-            #     momentum=False
-            # )
+        # driver = nk.driver.VMC_SR(
+        #     hamiltonian,
+        #     variational_state=vstate,
+        #     optimizer=optimizer,
+        #     diag_shift=config.optimizer.build_diag_shift(),
+        #     chunk_size_bwd=config.sr.chunk_size,
+        #     momentum=False
+        # )
         driver._step_count = step
         driver.run(
             config.n_steps - step,
@@ -248,10 +252,23 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=12, help="Number of MHA heads")
     parser.add_argument("--L", type=int, default=4, help="Lattice size of 2D lattice")
     parser.add_argument(
-        "--chunk_size", type=int, default=2**11, help="Jacobian chunk size NTK"
+        "--chunk_size", type=int, default=None, help="Jacobian chunk size NTK"
     )
     parser.add_argument("--seed", type=int, default=100, help="Seed")
-    parser.add_argument("--experiment_name", type=str, default="Feb12", help="Experiment name")
+    parser.add_argument(
+        "--experiment_name", type=str, default="Feb15", help="Experiment name"
+    )
+    parser.add_argument(
+        "--diag_shift", type=float, default=1e-3, help="Diagonal shift for SR"
+    )
+    parser.add_argument("--q", type=float, default=None, help="Bridge weight")
+    parser.add_argument(
+        "--thermalizing_steps",
+        type=int,
+        default=1000,
+        help="Number of thermalizing steps",
+    )
+    parser.add_argument("--lr", type=float, default=0.0075, help="Learning rate")
     args = parser.parse_args()
 
     main(args)

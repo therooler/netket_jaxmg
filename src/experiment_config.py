@@ -167,9 +167,7 @@ class HeisenbergConfig(HamiltonianConfig):
         if self._built_object is not None:
             return self._built_object
         hamiltonian = nk.operator.Heisenberg(
-            hilbert=hilbert,
-            graph=lattice,
-            sign_rule=self.sign_rule,
+            hilbert=hilbert, graph=lattice, sign_rule=self.sign_rule, J=0.25
         ).to_jax_operator()
         self._built_object = hamiltonian
         return hamiltonian
@@ -230,7 +228,7 @@ class SamplerConfig:
             graph=lattice,
             d_max=self.d_max,
             n_chains_per_rank=n_chains_per_rank,
-            sweep_size=self.sweep_size or lattice.n_nodes,
+            sweep_size=self.sweep_size or lattice.n_nodes
         )
         self._built_object = sampler
         return sampler
