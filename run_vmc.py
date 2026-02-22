@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_analytical_sol_latency_estimator=false"
-# os.environ["NETKET_EXPERIMENTAL_FFT_AUTOCORRELATION"] = "false"
 
 if platform.system() == "Linux":
     try:
@@ -17,7 +16,6 @@ if platform.system() == "Linux":
         print(f"world_size: {world_size}")
         print(f"rank: {rank}")
         cuda_visible_devices = os.environ["CUDA_VISIBLE_DEVICES"]
-        time.sleep(1)
         import jax
 
         jax.distributed.initialize(
@@ -93,7 +91,11 @@ def check_info(step, log, driver, save_path):
         else:
             # np.save(save_path + f"error_local_energies_{step%10}.npy", driver.state.local_estimators(driver._ham))
             return True
-    return ~jnp.isnan(driver._loss_stats.mean)
+    if jnp.isnan(driver._loss_stats.mean):
+        print(f"NaN encountered in loss: {driver._loss_stats}")
+        return False
+    else:
+        return True
 
 
 fields_to_track = (("Energy", "Mean"), ("Energy", "Variance"))
@@ -102,10 +104,6 @@ fields_to_track = (("Energy", "Mean"), ("Energy", "Variance"))
 def main(args, return_logger=False):
     lattice_cfg = TriangularConfig(L=args.L, max_neighbor_order=1)
     hilbert_cfg = HilbertConfig(total_sz=0)
-    # critical_h = 3.044382
-    # tfim_cfg = TFIMConfig(J=1.0, h=critical_h)
-    # J2=0.0
-    # system_cfg = J1J2Config(J=(1.0, J2))
     system_cfg = HeisenbergConfig(sign_rule=None)
     sampler_cfg = SamplerConfig()
     model_cfg = ViT2DConfig(
@@ -114,13 +112,15 @@ def main(args, return_logger=False):
         d_model=args.d_model,
         heads=args.heads,
     )
-    diag_shift_cfg = ConstantSchedule(args.diag_shift)
-    # ConstantSchedule(value=0.01)
+    diag_shift_cfg = ConstantSchedule(value=args.diag_shift)
     lr_init = args.lr
     lr_cfg = CosineDecaySchedule(lr_init, 10000, lr_init / 10)
     optimizer_cfg = OptimizerConfig(lr=lr_cfg, diag_shift=diag_shift_cfg)
     # sr_cfg = SRConfig(chunk_size=None)
-    sr_cfg = SRConfig(chunk_size=args.chunk_size)
+    chunk_size = getattr(args, "chunk_size", None)
+    momentum = getattr(args, "momentum", False)
+    print(f"chunk_size = {chunk_size} - momentum = {momentum}")
+    sr_cfg = SRConfig(chunk_size=chunk_size, momentum=momentum)
 
     config = ExperimentConfig(
         seed=args.seed,
@@ -165,7 +165,7 @@ def main(args, return_logger=False):
         n_samples_per_rank=sampler.n_chains_per_rank,
         chunk_size=config.sr.chunk_size,
         n_discard_per_chain=0,
-        seed=subkey
+        seed=subkey,
     )
     npar = vstate.n_parameters
     print(f"Number of parameters {npar}")
@@ -205,27 +205,10 @@ def main(args, return_logger=False):
             optimizer=optimizer,
             diag_shift=config.optimizer.build_diag_shift(),
             chunk_size_bwd=config.sr.chunk_size,
-            momentum=False,
+            momentum=True,
             linear_solver=linear_solver,
-            q=args.q,
         )
-        # else:
-        #     driver = VMC_SR(
-        #         hamiltonian,
-        #         variational_state=vstate,
-        #         optimizer=optimizer,
-        #         diag_shift=config.optimizer.build_diag_shift(),
-        #         chunk_size_bwd=config.sr.chunk_size,
-        #         momentum=False
-        #     )
-        # driver = nk.driver.VMC_SR(
-        #     hamiltonian,
-        #     variational_state=vstate,
-        #     optimizer=optimizer,
-        #     diag_shift=config.optimizer.build_diag_shift(),
-        #     chunk_size_bwd=config.sr.chunk_size,
-        #     momentum=False
-        # )
+
         driver._step_count = step
         driver.run(
             config.n_steps - step,
@@ -256,12 +239,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=100, help="Seed")
     parser.add_argument(
-        "--experiment_name", type=str, default="Feb15", help="Experiment name"
+        "--experiment_name", type=str, default="Feb22", help="Experiment name"
     )
+    parser.add_argument("--momentum", type=bool, default=False, help="Turn on SPRING")
     parser.add_argument(
         "--diag_shift", type=float, default=1e-3, help="Diagonal shift for SR"
     )
-    parser.add_argument("--q", type=float, default=None, help="Bridge weight")
     parser.add_argument(
         "--thermalizing_steps",
         type=int,

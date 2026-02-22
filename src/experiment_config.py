@@ -392,7 +392,15 @@ class OptimizerConfig:
 @dataclass
 class SRConfig:
     chunk_size: Optional[int] = None
+    momentum: Optional[bool] = False
 
+    def __post_init__(self):
+        if not self.chunk_size in [-1,None]:
+            self.name =f"chunk_size_{self.chunk_size}"
+        else:
+            self.name = "chunk_size_None"
+        if self.momentum:
+            self.name = self.name + f"momentum_{self.momentum}"
 
 @dataclass
 class ExperimentConfig:
@@ -462,7 +470,7 @@ class ExperimentConfig:
 
     def save_path(self) -> str:
         base = self.root.rstrip("/")
-        suffix = f"{self.name}/{self.hamiltonian.name}/{self.lattice.name}/{self.model.name}/{self.optimizer.name}/ns_{self.n_samples}/seed_{self.seed}/"
+        suffix = f"{self.name}/{self.hamiltonian.name}/{self.lattice.name}/{self.model.name}/{self.sr.name}/{self.optimizer.name}/ns_{self.n_samples}/seed_{self.seed}/"
         return os.path.join(base, suffix)
 
     def override(self, updates: Dict[str, Any]) -> "ExperimentConfig":
