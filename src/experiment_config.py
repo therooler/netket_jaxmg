@@ -217,6 +217,7 @@ class SamplerConfig:
     name: Literal["MetropolisExchange"] = "MetropolisExchange"
     d_max: int = 2
     sweep_size: Optional[int] = None  # defaults to lattice.n_nodes
+    q_blur: float | None=None
     _built_object: Optional[object] = field(default=None, init=False, repr=False)
 
     def build(self, hilbert, lattice, n_chains_per_rank: int):
@@ -378,9 +379,11 @@ class ViT2DConfig(ModelConfig):
 class OptimizerConfig:
     lr: Schedule = field(default_factory=lambda: ConstantSchedule(value=0.01))
     diag_shift: Schedule = field(default_factory=ExponentialDecaySchedule)
-
+    auto_tune_lr: bool = False
     def __post_init__(self):
         self.name = f"lr_{self.lr.name}/diag_shift_{self.diag_shift.name}"
+        if self.auto_tune_lr:
+            self.name = "auto_tune_" + self.name
 
     def build_diag_shift(self):
         return _build_schedule(self.diag_shift)
@@ -470,7 +473,8 @@ class ExperimentConfig:
 
     def save_path(self) -> str:
         base = self.root.rstrip("/")
-        suffix = f"{self.name}/{self.hamiltonian.name}/{self.lattice.name}/{self.model.name}/{self.sr.name}/{self.optimizer.name}/ns_{self.n_samples}/seed_{self.seed}/"
+        blur_str = f"_q_{self.sampler.q_blur:1.2f}" if self.sampler.q_blur is not None else ""
+        suffix = f"{self.name}/{self.hamiltonian.name}/{self.lattice.name}/{self.model.name}/{self.sr.name}/{self.optimizer.name}/ns_{self.n_samples}{blur_str}/seed_{self.seed}/"
         return os.path.join(base, suffix)
 
     def override(self, updates: Dict[str, Any]) -> "ExperimentConfig":

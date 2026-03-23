@@ -10,7 +10,7 @@ from netket import jax as nkjax
 from netket.hilbert import SpinOrbitalFermions
 from netket.optimizer.solver import cholesky
 from netket.vqs import MCState, FullSumState
-from netket.utils import timing, struct
+from netket.utils import timing, struct, HashablePartial
 from netket.utils.citations import reference
 from netket.utils.deprecation import DeprecatedArg
 from netket.utils.types import ScalarOrSchedule, Optimizer, Array, PyTree
@@ -21,11 +21,11 @@ from netket import stats as nkstats
 from netket.driver.abstract_variational_driver import (
     AbstractVariationalDriver,
 )
+from .blurred_sampling import blurred_sample, ess_from_weights
 
 # from .srt_common import srt
 from .srt import srt_onthefly as srt_onthefly_custom
-from netket._src.ngd.srt_onthefly import srt_onthefly
-
+import optax
 
 ApplyFun = Callable[[PyTree, Array], Array]
 KernelArgs = tuple[ApplyFun, PyTree, Array, tuple[Any, ...]]
@@ -249,8 +249,8 @@ class VMC_SR(AbstractVariationalDriver):
     def __init__(
         self,
         hamiltonian: AbstractOperator,
-        optimizer: Optimizer,
         *,
+        learning_rate: ScalarOrSchedule,
         diag_shift: ScalarOrSchedule,
         proj_reg: ScalarOrSchedule | None = None,
         momentum: ScalarOrSchedule | None = None,
@@ -261,6 +261,8 @@ class VMC_SR(AbstractVariationalDriver):
         variational_state: MCState,
         chunk_size_bwd: int | None = None,
         mode: JacobianMode | None = None,
+        auto_tune_lr: bool = False,
+        q_blur: float | None = None,
     ):
         r"""
         Initialize the driver with the given arguments.
@@ -338,6 +340,7 @@ class VMC_SR(AbstractVariationalDriver):
             raise TypeError(
                 "NGD drivers do not support FullSumState. Please use 'standard' drivers with SR."
             )
+        optimizer = optax.inject_hyperparams(optax.sgd)(learning_rate=1.0)
         super().__init__(variational_state, optimizer, minimized_quantity_name="Energy")
 
         # for most fermionic calculations you want to use real mode, but the auto
@@ -372,9 +375,12 @@ class VMC_SR(AbstractVariationalDriver):
 
         self._old_updates: PyTree = None
         self._dp: PyTree = None
-
+        self._auto_tune_lr = auto_tune_lr
+        self._learning_rate = learning_rate
+        self._internal_lr = None
         # PyTree to pass on information from the solver, e.g, the quadratic model
         self.info = None
+        self.q_blur = q_blur
 
         params_structure = jax.tree_util.tree_map(
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), self.state.parameters
@@ -388,11 +394,61 @@ class VMC_SR(AbstractVariationalDriver):
     @timing.timed
     def _forward_and_backward(self):
         self.state.reset()
+        # Get learning rate from schedule
+        if callable(self._learning_rate):
+            sched_lr = self._learning_rate(self.step_count)
+        else:
+            sched_lr = self._learning_rate
+        self._optimizer_state.hyperparams["learning_rate"] = sched_lr
 
         # Compute the local energy estimator and average Energy
-        local_energies = self.state.local_estimators(self._ham)
+        samples = _flatten_samples(self.state.samples)
+        if self.q_blur is not None:
+            self.state._sampler_seed, key = jax.random.split(
+                self.state._sampler_seed, 2
+            )
+            samples, importance_weights, local_energies = HashablePartial(
+                blurred_sample,
+                apply_fn=self.state._apply_fun,
+                op=self._ham,
+                q=self.q_blur,
+                chunk_size=self.state.chunk_size,
+            )(samples, key, self.state.parameters)
+            # Get S-matrix
+            pdf = importance_weights.reshape(samples.shape[:-1])
+        else:
+            local_energies = self.state.local_estimators(self._ham)
+            pdf = None
+        previous_loss = self._loss_stats
         self._loss_stats = nkstats.statistics(local_energies)
+        # If we're autotuning look at the losses
+        if self._auto_tune_lr and previous_loss is not None:
+            # On first step, we set to the self.optimizer learning rate
+            if self._internal_lr is None:
+                assert (
+                    self.step_count == 1
+                ), f"step {self.step_count}, but self._internal_lr=None, restore the correct self._internal_lr before running the driver"
+                self._internal_lr = self._optimizer_state.hyperparams["learning_rate"]
 
+            # if loss is increasing, shrink lr
+            delta = self._loss_stats.mean - previous_loss.mean
+            se = jnp.sqrt(
+                self._loss_stats.error_of_mean**2 + previous_loss.error_of_mean**2
+            )
+            k = 1
+            if delta > k * se:
+                # print("Shrinking")
+                self._internal_lr = self._internal_lr * 0.9
+            elif delta < -k * se:
+                # print("Growing")
+                self._internal_lr = jnp.clip(
+                    self._internal_lr * 1.005, min=sched_lr / 10, max=sched_lr
+                )
+            else:
+                pass
+            # print(f"Schedule LR {sched_lr} - Internal LR {self._internal_lr}")
+            self._optimizer_state.hyperparams["learning_rate"] = self._internal_lr
+            # if self._loss_stats.mean >previous_loss.mean + error:
         # Extract the hyperparameters which might be iteration dependent
         diag_shift = self.diag_shift
         proj_reg = self.proj_reg
@@ -404,68 +460,6 @@ class VMC_SR(AbstractVariationalDriver):
         if callable(momentum):
             momentum = momentum(self.step_count)
 
-        samples = _flatten_samples(self.state.samples)
-        # from netket.optimizer.solver import cholesky
-        # self._dp_old,self._old_updates_old, self.info  = srt_onthefly(
-        #     self.state._apply_fun,
-        #     local_energies,
-        #     self.state.parameters,
-        #     self.state.model_state,
-        #     samples,
-        #     diag_shift=diag_shift,
-        #     solver_fn=cholesky,
-        #     mode=self.mode,
-        #     proj_reg=proj_reg,
-        #     momentum=momentum,
-        #     old_updates=self._old_updates,
-        #     chunk_size=self.chunk_size_bwd,
-        # )
-        # print(
-        #     jax.make_jaxpr(
-        #         lambda le, p, ms, s: srt_onthefly_custom(
-        #             self.state._apply_fun,
-        #             le,
-        #             p,
-        #             ms,
-        #             s,
-        #             diag_shift=diag_shift,
-        #             solver_fn=self._linear_solver,
-        #             mode=self.mode,
-        #             proj_reg=proj_reg,
-        #             momentum=momentum,
-        #             old_updates=self._old_updates,
-        #             chunk_size=None,
-        #         )
-        #     )(
-        #         local_energies,
-        #         self.state.parameters,
-        #         self.state.model_state,
-        #         samples,
-        #     )
-        # )
-        # compiled = jax.jit(
-        #         lambda le, p, ms, s: srt_onthefly_custom(
-        #             self.state._apply_fun,
-        #             le,
-        #             p,
-        #             ms,
-        #             s,
-        #             diag_shift=diag_shift,
-        #             solver_fn=self._linear_solver,
-        #             mode=self.mode,
-        #             proj_reg=proj_reg,
-        #             momentum=momentum,
-        #             old_updates=self._old_updates,
-        #             chunk_size=None,
-        #         )
-        #     ).lower(
-        #         local_energies,
-        #         self.state.parameters,
-        #         self.state.model_state,
-        #         samples,
-        #     )
-        # print(compiled.compiler_ir(dialect="hlo").as_hlo_text())
-        # exit()
         self._dp, self._old_updates, self.info = srt_onthefly_custom(
             self.state._apply_fun,
             local_energies,
@@ -479,12 +473,9 @@ class VMC_SR(AbstractVariationalDriver):
             momentum=momentum,
             old_updates=self._old_updates,
             chunk_size=self.chunk_size_bwd,
+            pdf=pdf
         )
 
-        # assert jax.tree.all(jax.tree.map(jnp.allclose, self._dp, self._dp_old))
-        # assert jax.tree.all(jax.tree.map(jnp.allclose, self._old_updates, self._old_updates_old))
-        # print("Passed assertion.")
-        # exit()
         return self._dp
 
     @timing.timed
@@ -504,7 +495,8 @@ class VMC_SR(AbstractVariationalDriver):
             acceptance = getattr(self.state.sampler_state, "acceptance", None)
             if acceptance is not None:
                 log_dict["acceptance"] = acceptance
-
+        if self._auto_tune_lr:
+            log_dict["internal_lr"] = self._internal_lr
         # Log the quadratic model if requested.
         if self.info is not None:
             log_dict["info"] = self.info

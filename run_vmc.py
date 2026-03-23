@@ -79,6 +79,7 @@ if system == "Linux":
     JAXMG_ENABLED = True
 else:
     JAXMG_ENABLED = False
+# JAXMG_ENABLED=False
 
 
 def check_info(step, log, driver, save_path):
@@ -98,24 +99,29 @@ def check_info(step, log, driver, save_path):
         return True
 
 
-fields_to_track = (("Energy", "Mean"), ("Energy", "Variance"))
+fields_to_track = (("Energy", "Mean"), ("Energy", "Variance"), ("internal_lr", "values"))
 
-
+nk.models.tensor_networks.MPSOpen
 def main(args, return_logger=False):
     lattice_cfg = TriangularConfig(L=args.L, max_neighbor_order=1)
     hilbert_cfg = HilbertConfig(total_sz=0)
     system_cfg = HeisenbergConfig(sign_rule=None)
-    sampler_cfg = SamplerConfig()
+    sampler_cfg = SamplerConfig(q_blur=args.q_blur)
     model_cfg = ViT2DConfig(
         patch_size=args.patch_size,
         num_layers=args.num_layers,
         d_model=args.d_model,
         heads=args.heads,
     )
-    diag_shift_cfg = ConstantSchedule(value=args.diag_shift)
+    # diag_shift_cfg = CosineDecaySchedule(args.diag_shift * 10, 1000, args.diag_shift)
+    # diag_shift_cfg = CosineDecaySchedule(1e-1, 200, args.diag_shift)
+    diag_shift_cfg = ConstantSchedule(args.diag_shift)
     lr_init = args.lr
     lr_cfg = CosineDecaySchedule(lr_init, 10000, lr_init / 10)
-    optimizer_cfg = OptimizerConfig(lr=lr_cfg, diag_shift=diag_shift_cfg)
+    auto_tune_lr = getattr(args, "auto_tune_lr", False)
+    optimizer_cfg = OptimizerConfig(
+        lr=lr_cfg, diag_shift=diag_shift_cfg, auto_tune_lr=auto_tune_lr
+    )
     # sr_cfg = SRConfig(chunk_size=None)
     chunk_size = getattr(args, "chunk_size", None)
     momentum = getattr(args, "momentum", False)
@@ -147,7 +153,7 @@ def main(args, return_logger=False):
         path=save_path, fields=fields_to_track, save_every=10, rank=jax.process_index()
     )
     if return_logger:
-        return logger
+        return logger, config
 
     print(config)
     print(f"Save path {config.save_path()}")
@@ -174,20 +180,24 @@ def main(args, return_logger=False):
     restored = logger.restore(vstate)
     if restored:
         step = logger.data["iters"]["values"][-1]
-        # logger.restore_samples(vstate)
+        internal_lrs = (
+            logger.data["internal_lr"]["values"]
+            if "internal_lr" in logger.data
+            else []
+        )
+        internal_lr = internal_lrs[-1] if internal_lrs else None
         print("Restored step:", step)
         print("Last energy:", logger.data["Energy"]["Mean"][-1])
     else:
         step = 0
+        internal_lr = None
     if step < config.n_steps - 1:
-        print("Thermalizing...")
-        for _ in tqdm(range(config.thermalize_steps)):
-            x = vstate.sample()
-        print("Thermalizing done")
+        if restored:
+            print("Thermalizing...")
+            for _ in tqdm(range(config.thermalize_steps)):
+                x = vstate.sample()
+            print("Thermalizing done")
         print("SR optimization")
-
-        optimizer = optax.sgd(learning_rate=config.optimizer.build_lr())
-
         print(sampler.n_chains_per_rank)
         if JAXMG_ENABLED:
             print("Using JAXMg...")
@@ -195,21 +205,24 @@ def main(args, return_logger=False):
                 potrs,
                 T_A=2**12,
                 mesh=jax.sharding.get_abstract_mesh(),
-                in_specs=(P("S", None), P(None, None)),
+                in_specs=(P("S", None), ),
             )
         else:
             linear_solver = nk.optimizer.solver.cholesky
         driver = VMC_SR(
             hamiltonian,
             variational_state=vstate,
-            optimizer=optimizer,
+            learning_rate=config.optimizer.build_lr(),
             diag_shift=config.optimizer.build_diag_shift(),
             chunk_size_bwd=config.sr.chunk_size,
-            momentum=True,
+            momentum=momentum,
             linear_solver=linear_solver,
+            auto_tune_lr=config.optimizer.auto_tune_lr,
+            q_blur=config.sampler.q_blur
         )
 
         driver._step_count = step
+        driver._internal_lr = internal_lr
         driver.run(
             config.n_steps - step,
             out=logger,
@@ -239,16 +252,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=100, help="Seed")
     parser.add_argument(
-        "--experiment_name", type=str, default="Feb22", help="Experiment name"
+        "--auto_tune_lr", type=bool, default=False, help="Regulate the learning rate"
+    )
+    parser.add_argument(
+        "--experiment_name", type=str, default="Mar8", help="Experiment name"
     )
     parser.add_argument("--momentum", type=bool, default=False, help="Turn on SPRING")
     parser.add_argument(
         "--diag_shift", type=float, default=1e-3, help="Diagonal shift for SR"
     )
     parser.add_argument(
+        "--q_blur", type=float, default=None, help="Blurred sampling strength"
+    )
+    parser.add_argument(
         "--thermalizing_steps",
         type=int,
-        default=1000,
+        default=0,
         help="Number of thermalizing steps",
     )
     parser.add_argument("--lr", type=float, default=0.0075, help="Learning rate")
