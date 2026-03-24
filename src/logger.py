@@ -166,7 +166,7 @@ class Logger:
         self._step = 0
         self._data = {}
         self._data['iters'] = {'values': []}
-        allowed_attributes = ['Mean', 'Variance', 'values', 'R_hat', 'Generator', 'tau_corr', ]
+        allowed_attributes = ['Mean', 'Variance', 'values', 'R_hat', 'Generator', 'tau_corr','Sigma' ]
 
         for f in self._fields:
             assert isinstance(f[0], str) and isinstance(f[1], str), 'Fields must be a tuple of type `(str, str)`'

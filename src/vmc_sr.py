@@ -381,7 +381,8 @@ class VMC_SR(AbstractVariationalDriver):
         # PyTree to pass on information from the solver, e.g, the quadratic model
         self.info = None
         self.q_blur = q_blur
-
+        self.ess = None
+        self.weighted_variance = None
         params_structure = jax.tree_util.tree_map(
             lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), self.state.parameters
         )
@@ -415,12 +416,25 @@ class VMC_SR(AbstractVariationalDriver):
                 chunk_size=self.state.chunk_size,
             )(samples, key, self.state.parameters)
             # Get S-matrix
-            pdf = importance_weights.reshape(samples.shape[:-1])
+            importance_weights = importance_weights.reshape(samples.shape[:-1])
+            self.ess = ess_from_weights(importance_weights)
         else:
             local_energies = self.state.local_estimators(self._ham)
-            pdf = None
+            importance_weights = None
+            self.ess = 1.
+    
         previous_loss = self._loss_stats
-        self._loss_stats = nkstats.statistics(local_energies)
+        if importance_weights is not None:
+            # Importance-weighted energy: mean(w * E) = sum_s p_s E_s when mean(w)=1
+            _w_mean = jnp.mean(importance_weights)
+            pdf = (importance_weights / _w_mean)[:, None]   # [N_mc, 1], mean=1
+            self._loss_stats = nkstats.statistics(local_energies * pdf)
+            # self.weighted_variance = _w_mean**2 * (pdf.size / (pdf.size-1)) * (jnp.mean(pdf * local_energies.real**2) - jnp.mean(pdf * local_energies.real)**2)
+            self.weighted_variance = _w_mean**2 * (pdf.size / (pdf.size-1)) * jnp.mean(pdf * jnp.abs(local_energies - jnp.mean(pdf * local_energies))**2)
+            pdf = pdf.squeeze(axis=-1)
+        else:
+            pdf=None
+            self._loss_stats = nkstats.statistics(local_energies)
         # If we're autotuning look at the losses
         if self._auto_tune_lr and previous_loss is not None:
             # On first step, we set to the self.optimizer learning rate
@@ -500,6 +514,10 @@ class VMC_SR(AbstractVariationalDriver):
         # Log the quadratic model if requested.
         if self.info is not None:
             log_dict["info"] = self.info
+        if self.ess is not None:
+            log_dict["ess"] = self.ess
+        if self.weighted_variance is not None:
+            log_dict["weighted_variance"] = self.weighted_variance.real
 
     @property
     def mode(self) -> JacobianMode:

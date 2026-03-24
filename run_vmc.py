@@ -99,9 +99,19 @@ def check_info(step, log, driver, save_path):
         return True
 
 
-fields_to_track = (("Energy", "Mean"), ("Energy", "Variance"), ("internal_lr", "values"))
+fields_to_track = (
+    ("Energy", "Mean"),
+    ("Energy", "Variance"),
+    ("Energy", "Sigma"),
+    ("internal_lr", "values"),
+    ("acceptance", "values"),
+    ("ess", "values"),
+    ("weighted_variance", "values"),
+)
 
 nk.models.tensor_networks.MPSOpen
+
+
 def main(args, return_logger=False):
     lattice_cfg = TriangularConfig(L=args.L, max_neighbor_order=1)
     hilbert_cfg = HilbertConfig(total_sz=0)
@@ -144,17 +154,18 @@ def main(args, return_logger=False):
         sr=sr_cfg,
     )
     save_path = config.save_path()
-    if jax.process_index() == 0:
-        print(f"Making path in process {jax.process_index()}")
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        config.save_config_yaml()
+    
     logger = Logger(
         path=save_path, fields=fields_to_track, save_every=10, rank=jax.process_index()
     )
     if return_logger:
         return logger, config
 
+    if jax.process_index() == 0:
+        print(f"Making path in process {jax.process_index()}")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        config.save_config_yaml()
     print(config)
     print(f"Save path {config.save_path()}")
 
@@ -181,9 +192,7 @@ def main(args, return_logger=False):
     if restored:
         step = logger.data["iters"]["values"][-1]
         internal_lrs = (
-            logger.data["internal_lr"]["values"]
-            if "internal_lr" in logger.data
-            else []
+            logger.data["internal_lr"]["values"] if "internal_lr" in logger.data else []
         )
         internal_lr = internal_lrs[-1] if internal_lrs else None
         print("Restored step:", step)
@@ -205,7 +214,7 @@ def main(args, return_logger=False):
                 potrs,
                 T_A=2**12,
                 mesh=jax.sharding.get_abstract_mesh(),
-                in_specs=(P("S", None), ),
+                in_specs=(P("S", None),),
             )
         else:
             linear_solver = nk.optimizer.solver.cholesky
@@ -218,7 +227,7 @@ def main(args, return_logger=False):
             momentum=momentum,
             linear_solver=linear_solver,
             auto_tune_lr=config.optimizer.auto_tune_lr,
-            q_blur=config.sampler.q_blur
+            q_blur=config.sampler.q_blur,
         )
 
         driver._step_count = step

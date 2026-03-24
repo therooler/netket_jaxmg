@@ -169,7 +169,7 @@ class HeisenbergConfig(HamiltonianConfig):
         hamiltonian = nk.operator.Heisenberg(
             hilbert=hilbert, graph=lattice, sign_rule=self.sign_rule, J=0.25
         ).to_jax_operator()
-        self._built_object = hamiltonian
+        self._built_object = hamiltonian.to_jax_operator()
         return hamiltonian
 
 
@@ -217,7 +217,7 @@ class SamplerConfig:
     name: Literal["MetropolisExchange"] = "MetropolisExchange"
     d_max: int = 2
     sweep_size: Optional[int] = None  # defaults to lattice.n_nodes
-    q_blur: float | None=None
+    q_blur: float | None = None
     _built_object: Optional[object] = field(default=None, init=False, repr=False)
 
     def build(self, hilbert, lattice, n_chains_per_rank: int):
@@ -229,7 +229,7 @@ class SamplerConfig:
             graph=lattice,
             d_max=self.d_max,
             n_chains_per_rank=n_chains_per_rank,
-            sweep_size=self.sweep_size or lattice.n_nodes
+            sweep_size=self.sweep_size or lattice.n_nodes,
         )
         self._built_object = sampler
         return sampler
@@ -380,6 +380,7 @@ class OptimizerConfig:
     lr: Schedule = field(default_factory=lambda: ConstantSchedule(value=0.01))
     diag_shift: Schedule = field(default_factory=ExponentialDecaySchedule)
     auto_tune_lr: bool = False
+
     def __post_init__(self):
         self.name = f"lr_{self.lr.name}/diag_shift_{self.diag_shift.name}"
         if self.auto_tune_lr:
@@ -398,12 +399,13 @@ class SRConfig:
     momentum: Optional[bool] = False
 
     def __post_init__(self):
-        if not self.chunk_size in [-1,None]:
-            self.name =f"chunk_size_{self.chunk_size}"
+        if not self.chunk_size in [-1, None]:
+            self.name = f"chunk_size_{self.chunk_size}"
         else:
             self.name = "chunk_size_None"
         if self.momentum:
             self.name = self.name + f"momentum_{self.momentum}"
+
 
 @dataclass
 class ExperimentConfig:
@@ -473,7 +475,9 @@ class ExperimentConfig:
 
     def save_path(self) -> str:
         base = self.root.rstrip("/")
-        blur_str = f"_q_{self.sampler.q_blur:1.2f}" if self.sampler.q_blur is not None else ""
+        blur_str = (
+            f"_q_{self.sampler.q_blur:1.2f}" if self.sampler.q_blur is not None else ""
+        )
         suffix = f"{self.name}/{self.hamiltonian.name}/{self.lattice.name}/{self.model.name}/{self.sr.name}/{self.optimizer.name}/ns_{self.n_samples}{blur_str}/seed_{self.seed}/"
         return os.path.join(base, suffix)
 

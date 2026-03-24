@@ -46,11 +46,9 @@ def srt_onthefly(
 ):
     N_mc = local_energies.size
     if pdf is not None:
-        pdf = pdf / jnp.mean(pdf)
-        pdf = pdf / pdf.size
+        pdf = pdf / N_mc        # normalize to probability distribution: sum=1
     else:
-        pdf = 1.
-    print(pdf)
+        pdf = jnp.ones(N_mc) / N_mc       # uniform distribution
     # Split all parameters into real and imaginary parts separately
     parameters_real, rss = nkjax.tree_to_real(parameters)
 
@@ -79,11 +77,11 @@ def srt_onthefly(
 
     # compute rhs of the linear system
     local_energies = local_energies.flatten()
-    de = local_energies - jnp.mean(local_energies)
+    de = local_energies - jnp.sum(pdf * local_energies)   # weighted energy centering
 
-    # At the moment the final vjp is centered by centering the auxiliary vector a.
-    # This is the same as centering the jacobian but may have larger variance.
-    dv = 2.0 * de / jnp.sqrt(N_mc)  # shape [N_mc,]
+    # RHS of the kernel system: b_s = 2 * sqrt(p_s) * Delta_E_s
+    # For uniform p_s=1/N this reduces to 2*de/sqrt(N).
+    dv = 2.0 * jnp.sqrt(pdf) * de  # shape [N_mc,]
     if mode == "complex":
         dv = jnp.stack([jnp.real(dv), jnp.imag(dv)], axis=-1)  # shape [N_mc,2]
     else:
@@ -97,8 +95,9 @@ def srt_onthefly(
                 jvp_f_chunk, in_axes=(None, None, 0), chunk_size=chunk_size
             )(parameters_real, old_updates, samples)
 
-            avg = jnp.mean(acc, axis=0)
-            acc = (acc - avg) / jnp.sqrt(N_mc)
+            _pdf = pdf[:, None] if mode == "complex" else pdf
+            avg = jnp.sum(_pdf * acc, axis=0)   # weighted mean
+            acc = jnp.sqrt(_pdf) * (acc - avg)  # weighted centering + sqrt(p) scale
             dv -= momentum * acc
 
     if mode == "complex":
@@ -171,26 +170,34 @@ def srt_onthefly(
     else:
         ntk = ntk_local
     # print(ntk.shape)
+    w_sqrt = jnp.sqrt(pdf)  # [N_mc]
+
     if mode == "complex":
         # shape [2*N_mc, 2*N_mc] checked with direct calculation of J^T J
         ntk = rearrange(ntk, "i j z w -> (i z) (j w)")
         ntk = ntk.reshape(N_mc, 2, N_mc, 2)
-        # Compute means efficiently - axis 0 and 2 require all-reduce
-        mean_0 = ntk.mean(axis=0, keepdims=True)  # all-reduce
-        mean_2 = ntk.mean(axis=2, keepdims=True)  # all-reduce
-        mean_02 = mean_0.mean(axis=2, keepdims=True)  # local, reuse mean_0
-        ntk = ntk - mean_0 - mean_2 + mean_02
+        # Weighted double-centering on sample axes (0 and 2).
+        # m_col[i,a,b] = sum_j p_j * K[i,a,j,b]  (mean over j, axis 2)
+        # m_row[a,j,b] = sum_i p_i * K[i,a,j,b]  (mean over i, axis 0)
+        m_col = jnp.einsum("iajb,j->iab", ntk, pdf)      # [N_mc, 2, 2]
+        m_row = jnp.einsum("iajb,i->ajb", ntk, pdf)      # [2, N_mc, 2]
+        m_global = jnp.einsum("i,iab->ab", pdf, m_col)   # [2, 2]
+        ntk = (ntk
+               - m_col[:, :, None, :]        # [N_mc, 2,  1,  2]
+               - m_row[None, :, :, :]        # [ 1,  2, N_mc, 2]
+               + m_global[None, :, None, :]) # [ 1,  2,  1,  2]
+        # Apply W^{1/2}: tilde_K[i,a,j,b] = sqrt(p_i)*sqrt(p_j) * C[i,a,j,b]
+        ntk = ntk * (w_sqrt[:, None, None, None] * w_sqrt[None, None, :, None])
         ntk = ntk.reshape(2 * N_mc, 2 * N_mc)
     else:
-        # Compute means efficiently to minimize all-reduces
-        row_means = ntk.mean(axis=1, keepdims=True)  # local: mean over columns
-        col_means = ntk.mean(axis=0, keepdims=True)  # all-reduce: mean over rows
-        global_mean = (
-            col_means.mean()
-        )  # local: col_means is already gathered/replicated
-        ntk = ntk - col_means - row_means + global_mean
-
-    ntk = ntk / N_mc
+        # Weighted double-centering. NTK is symmetric so m = K @ pdf covers both axes.
+        # m[s] = sum_{s'} p_{s'} * K[s, s']
+        m = ntk @ pdf                                      # [N_mc]
+        m_global = jnp.dot(pdf, m)                        # scalar
+        ntk = ntk - m[:, None] - m[None, :] + m_global
+        # Apply W^{1/2}: tilde_K[s,s'] = sqrt(p_s)*sqrt(p_{s'}) * C[s,s']
+        ntk = ntk * jnp.outer(w_sqrt, w_sqrt)
+    # Note: no ntk / N_mc — the 1/N normalization is absorbed into p_s = 1/N
 
     # add diag shift
     # Create a sharded identity matrix to match ntk's sharding
@@ -232,18 +239,20 @@ def srt_onthefly(
     # # Center the vector, equivalent to centering
     # # The Jacobian
 
-    # shape [N_mc,2]
+    # Compute weighted VJP vector: tilde_v_s = a_s*sqrt(p_s) - c*p_s
+    # where c = sum_s a_s*sqrt(p_s).  For uniform p_s=1/N this reduces to
+    # (a_s - mean(a)) / sqrt(N), matching the previous centering step.
     aus_vector = jnp.squeeze(aus_vector)
     if mode == "real":
-        aus_vector = (
-            aus_vector - jnp.mean(aus_vector, axis=0, keepdims=True)
-        ) / jnp.sqrt(N_mc)
+        v = aus_vector * w_sqrt                               # [N_mc]
+        c = jnp.sum(v, keepdims=True)                        # scalar
+        aus_vector = v - c * pdf                             # [N_mc]
 
     if mode == "complex":
         aus_vector = aus_vector.reshape((N_mc, 2))
-        aus_vector = (
-            aus_vector - jnp.mean(aus_vector, axis=0, keepdims=True)
-        ) / jnp.sqrt(N_mc)
+        v = aus_vector * w_sqrt[:, None]                      # [N_mc, 2]
+        c = jnp.sum(v, axis=0, keepdims=True)                # [1, 2]
+        aus_vector = v - c * pdf[:, None]                    # [N_mc, 2]
 
     # shape [N_mc // p.size,2]
     if config.netket_experimental_sharding:
