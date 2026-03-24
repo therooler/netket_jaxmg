@@ -42,11 +42,14 @@ def srt_onthefly(
     momentum: float | Array | None = None,
     old_updates: Array | None = None,
     chunk_size: int | None = None,
-    pdf: Array | None = None,
+    pdf: Array,
 ):
     N_mc = local_energies.size
     if pdf is not None:
         pdf = pdf / jnp.mean(pdf)
+        pdf = pdf / pdf.size
+    else:
+        pdf = 1.
     print(pdf)
     # Split all parameters into real and imaginary parts separately
     parameters_real, rss = nkjax.tree_to_real(parameters)
